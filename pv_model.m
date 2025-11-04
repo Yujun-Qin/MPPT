@@ -20,8 +20,8 @@ I_ph = I_sc;
 % 输出电流与输出电压的计算   
 for iter = 1:1000
     I1 = I_o*(exp((q*V_PV)/(n*k*T*num_cells))-1);
-    I2 = (V_PV)/R_sh;
-    I_PV = I_ph - I1 - I2;
+    I2 = V_PV / R_sh;
+    I_PV = I_ph - I1 -I2;
     P = V_PV .* I_PV;    
 end
 I_PV = max(0, I_PV); % 确保电流非负

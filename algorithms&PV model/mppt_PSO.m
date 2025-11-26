@@ -1,7 +1,7 @@
-%% pv_mppt_boost_slopePO.m
+function [Plog] = mppt_PSO()
+% pv_mppt_boost_slopePO.m
 % 单文件：PV 单二极管模型 + 理想 Boost 平均模型 + 变步长(基于 dP/dV) P&O MPPT
 % 运行环境：MATLAB/Octave (fzero在Octave需optim包)
-clear; clc; close all;
 
 % ==== PV 组件与物理参数（可按实际组件微调）====
 pv.Ns        = 60;      % 串联片数
@@ -25,88 +25,85 @@ D    = 0.5;                 % 初始占空比
 % Rin = Rload * (1 - D)^2
 % 工作点满足 Ipv(V) = V / Rin。给定D可解得 Vpv。
 
-% ==== MPPT（基于斜率 dP/dV 的自适应扰动）参数 ====
-Nstep      = 300;      % 迭代步数
-Kgain      = 1e-3;     % 步长增益（依据斜率幅值放大）
-step_min   = 2e-4;     % 最小步长
-step_max   = 1.5e-2;   % 最大步长
-slope_eps  = 1e-3;     % 斜率近零时的死区
-slope_LP   = 0.7;      % 斜率一阶低通滤波系数 (0~1，越大越平滑)
+% ==== MPPT：粒子群算法（PSO-MPPT）====
 
-% 记录量
+Nstep    = 100;                 % 外层迭代次数
+Np       = 8;                   % 粒子数
+w        = 0.7;                 % 惯性权重
+c1       = 1.5;                 % 个体学习因子
+c2       = 1.5;                 % 群体学习因子
+Vmax_pso = 0.1 * (Dmax - Dmin); % 占空比变化最大步长
+
 Dlog = zeros(1,Nstep);
 Vlog = zeros(1,Nstep);
 Ilog = zeros(1,Nstep);
 Plog = zeros(1,Nstep);
 
-% 为首步初始化一个参考点
-[Vk, Ik] = solve_pv_operating_point(D, Rload, G, Tc, pv);
-Pk = Vk * Ik;
-dPdV_est_f = 0;   % 低通后的斜率估计初始化
+% 粒子初始化
+pos   = Dmin + (Dmax - Dmin) * rand(1, Np);   % 位置(占空比)
+vel   = zeros(1, Np);                         % 速度
+pbest_pos = pos;                              % 个体最好位置
+pbest_fit = -1e9 * ones(1, Np);               % 个体最好适应度(功率)
+
+gbest_pos = pos(1);                           % 全局最好位置
+gbest_fit = -1e9;                             % 全局最好适应度
 
 for k = 1:Nstep
-    % 1) 记录
-    Dlog(k) = D; Vlog(k) = Vk; Ilog(k) = Ik; Plog(k) = Pk;
+    % 1) 评估每个粒子当前适应度
+    for i = 1:Np
+        Di = pos(i);
+        [Vi, Ii] = solve_pv_operating_point(Di, Rload, G, Tc, pv);
+        Pi = Vi * Ii;
 
-    % 2) 预测下一个操作点以估计斜率 dP/dV（数值差分）
-    D_probe = min(max(D + 1e-3, Dmin), Dmax);     % 极小扰动，仅用于斜率估计
-    [V_probe, I_probe] = solve_pv_operating_point(D_probe, Rload, G, Tc, pv);
-    P_probe = V_probe * I_probe;
+        % 更新个体最好
+        if Pi > pbest_fit(i)
+            pbest_fit(i) = Pi;
+            pbest_pos(i) = Di;
+        end
 
-    dV   = (V_probe - Vk);
-    dP   = (P_probe - Pk);
-    dPdV = (abs(dV) > 1e-9) * (dP / (dV + (abs(dV)<=1e-9))) ; % 防除零
-    % 低通平滑斜率估计
-    dPdV_est_f = slope_LP*dPdV_est_f + (1 - slope_LP)*dPdV;
-
-    % 3) 依据 dP/dV 确定方向与自适应步长
-    if abs(dPdV_est_f) < slope_eps
-        dir = 0; 
-        step = step_min;           % 近MPP区域，保持最小步长（抖动小）
-    else
-        dir = sign(dPdV_est_f);    % dP/dV>0 => 增大V可增大P => 需要降低D
-        step = min(step_max, max(step_min, Kgain*abs(dPdV_est_f)));
+        % 更新全局最好
+        if Pi > gbest_fit
+            gbest_fit = Pi;
+            gbest_pos = Di;
+        end
     end
 
-    % 4) 更新占空比 (D↑ -> Vpv↓； 若希望V↑，则D应↓)
-    D = D - dir*step;              % dir>0 => 减小D；dir<0 => 增大D
-    D = min(max(D, Dmin), Dmax);   % 限幅
-
-    % 5) 用新D解新的工作点
+    % 2) 记录当前全局最优对应的工作点（视作本代 MPPT 输出）
+    D = gbest_pos;
     [Vk, Ik] = solve_pv_operating_point(D, Rload, G, Tc, pv);
-    Pk = Vk * Ik;
+    Pk       = Vk * Ik;
+
+    Dlog(k) = D;
+    Vlog(k) = Vk;
+    Ilog(k) = Ik;
+    Plog(k) = Pk;
+
+    % 3) 更新所有粒子的速度与位置 (下一代)
+    for i = 1:Np
+        r1 = rand();
+        r2 = rand();
+        vel(i) = w * vel(i) ...
+                 + c1 * r1 * (pbest_pos(i) - pos(i)) ...
+                 + c2 * r2 * (gbest_pos     - pos(i));
+
+        % 速度限幅
+        if vel(i) > Vmax_pso
+            vel(i) = Vmax_pso;
+        elseif vel(i) < -Vmax_pso
+            vel(i) = -Vmax_pso;
+        end
+
+        % 位置更新
+        pos(i) = pos(i) + vel(i);
+
+        % 位置限幅到占空比范围
+        if pos(i) > Dmax
+            pos(i) = Dmax;
+        elseif pos(i) < Dmin
+            pos(i) = Dmin;
+        end
+    end
 end
-
-% ==== 展示静态 I–V / P–V（当前G,T）以及MPPT最终点 ====
-[Vvec, Ivec] = sweep_pv_iv(G, Tc, pv);
-Pvec = Vvec .* Ivec;
-
-figure;
-plot(Vvec, Ivec, 'LineWidth',1.5); grid on; hold on;
-plot(Vlog(end), Ilog(end), 'o', 'MarkerSize',6);
-xlabel('V_{pv} (V)'); ylabel('I_{pv} (A)');
-title('PV I–V (current G,T) & MPPT result');
-legend('I–V','MPPT point','Location','best');
-
-figure;
-plot(Vvec, Pvec, 'LineWidth',1.5); grid on; hold on;
-plot(Vlog(end), Plog(end), 'o', 'MarkerSize',6);
-xlabel('V_{pv} (V)'); ylabel('P_{pv} (W)');
-title('PV P–V (current G,T) & MPPT result');
-legend('P–V','MPPT point','Location','best');
-
-% ==== 迭代过程曲线 ====
-figure; 
-plot(Plog,'LineWidth',1.2); grid on; xlabel('Iteration'); ylabel('P (W)');
-title('Convergence of Power');
-
-figure; 
-plot(Vlog,'LineWidth',1.2); grid on; xlabel('Iteration'); ylabel('V_{pv} (V)');
-title('PV Voltage vs. Iteration');
-
-figure; 
-plot(Dlog,'LineWidth',1.2); grid on; xlabel('Iteration'); ylabel('D');
-title('Duty Ratio vs. Iteration');
 
 % ===== 局部函数 =====
 function [Vsol, Isol] = solve_pv_operating_point(D, Rload, G, T, params)
@@ -133,9 +130,10 @@ end
 function I = pv_current_given_voltage(V, G, T, params)
     % 单二极管模型数值解 I(V):
     % I = Iph - I0*(exp((V+I*Rs)/(n*Vt)) - 1) - (V+I*Rs)/Rsh
-    q = 1.602176634e-19; k = 1.380649e-23;
+    q = 1.602176634e-19; 
+    k_b = 1.380649e-23;
     T_K = T + 273.15; 
-    Vt  = params.Ns * k*T_K / q;
+    Vt  = params.Ns * k_b*T_K / q;
     n   = params.n;
 
     % 光生电流 Iph
@@ -143,11 +141,11 @@ function I = pv_current_given_voltage(V, G, T, params)
     Iph = Iph_stc*(G/1000) + params.alpha_Isc*(T - 25);
 
     % 反向饱和电流 I0 温度修正（由Voc_stc反推I0_stc再修正）
-    Vt_stc = params.Ns * k*(25+273.15)/q;
+    Vt_stc = params.Ns * k_b*(25+273.15)/q;
     I0_stc = Iph_stc / (exp(params.Voc_stc/(n*Vt_stc)) - 1 + 1e-12);
     Eg = params.Eg;
     I0 = I0_stc * (T_K/(25+273.15)).^3 .* ...
-         exp( (q*Eg/k) * (1/(25+273.15) - 1/T_K) / (n*params.Ns) );
+         exp( (q*Eg/k_b) * (1/(25+273.15) - 1/T_K) / (n*params.Ns) );
 
     Rs  = params.Rs; Rsh = params.Rsh;
 
@@ -169,4 +167,5 @@ function [Vvec, Ivec] = sweep_pv_iv(G, T, params)
     for i = 1:numel(Vvec)
         Ivec(i) = pv_current_given_voltage(Vvec(i), G, T, params);
     end
+end
 end
